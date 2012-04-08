@@ -1,0 +1,9 @@
+
+require 'rack-livetraffic/top'
+require 'yaml'
+path = ARGV.first || './config/livetraffic.yaml'
+hash = YAML.load_file path
+cfg  = hash[:top][:worker]
+
+Rack::LiveTraffic::Top.new(cfg).run do |i|
+end

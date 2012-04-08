@@ -1,0 +1,30 @@
+---
+:middleware:
+  :cookie: 'optionally-pick-a-cookie-name-that-uniquely-identify-users' #if a cookie uniquely identify a user in your application, set its name here
+  :push: 'tcp://localhost:5555' #push of request digests
+:dispatch:
+  :pull: 'tcp://*:5555' #pull of request digests
+  :publish: 'tcp://*:5556' #publication of request digests
+:top:
+  :worker:
+    :duration: 300 #how many seconds in the past does the history last
+    :period: 5 #how many seconds to wait between results recomputation
+    :multi_slices: true #set to true to handle dynamically different rack_id
+    :read_only: false #keep to false
+    :subscribe: 'tcp://localhost:5556' #subscription for receiving request digests
+    :publish: 'tcp://*:5558' #publication of statistics
+  :script:
+    :period: 3 
+    :duration: 300
+:persist:
+  :http:
+    :ttl: 10 #how long do we persist requests in the cache?
+    :randmax: 65535 #random ID. should be significantly larger than the request rate (in req/sec)
+    :consumer: #subscription to request digests
+      - 'report'
+      - 'tcp://localhost:5556'
+  :stats:
+    :ttl: 300
+    :consumer:  #subscription to statistics
+      - 'stats'
+      - 'tcp://localhost:5558' 

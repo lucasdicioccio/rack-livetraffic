@@ -1,0 +1,34 @@
+
+require 'rack-livetraffic/top'
+require 'yaml'
+require 'json'
+
+args = ARGV.dup
+rack_id  = args.shift || ''
+
+if rack_id.start_with?('--')
+  puts "warning, rackid: #{rack_id} may be treated as a parameter"
+end
+
+cfg_path = args.dup.shift || './config/livetraffic.yaml'
+hash = YAML.load_file cfg_path
+cfg = hash[:top][:script] || {}
+cfg[:rack_id] ||= rack_id || ''
+cfg[:reload] ||= []
+cfg[:reload] << :redis_http  unless ARGV.include?('--no-redis-http')
+cfg[:reload] << :redis_stats unless ARGV.include?('--no-redis-stats')
+infinite = ARGV.include? '--loop'
+cfg[:read_only] ||= ! infinite
+
+
+Rack::LiveTraffic::Top.new(cfg).run do |top|
+  # on some cases computations may give "infinity", which JSON cannot represent
+  begin
+    puts top[rack_id].to_json
+  rescue JSON::GeneratorError
+    $stderr.puts "err translating to JSON:"
+    $stderr.puts top[rack_id].inspect
+  ensure
+    throw :kill unless infinite
+  end
+end

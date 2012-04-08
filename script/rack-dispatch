@@ -1,0 +1,9 @@
+
+require 'rack-livetraffic/republisher'
+require 'yaml'
+path = ARGV.first || './config/livetraffic.yaml'
+hash = YAML.load_file path
+cfg  = hash[:dispatch] 
+
+Rack::LiveTraffic::Republisher.new(cfg).run  do |i|
+end

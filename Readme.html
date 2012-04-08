@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC
+    "-//W3C//DTD XHTML 1.1 plus MathML 2.0 plus SVG 1.1//EN"
+    "http://www.w3.org/2002/04/xhtml-math-svg/xhtml-math-svg.dtd">
+<html xml:lang='en' xmlns:svg='http://www.w3.org/2000/svg' xmlns='http://www.w3.org/1999/xhtml'>
+<head><meta content='application/xhtml+xml;charset=utf-8' http-equiv='Content-type' /><title>Rack LiveTraffic</title></head>
+<body>
+<h1 id='rack_livetraffic'>Rack LiveTraffic</h1>
+
+<p>A solution for the <a href='HTTP://contest.dimelo.com/2012/03/06/ruby-easter-egg-contest.html'>Easter Dimelo contest</a>.</p>
+
+<h2 id='requirements'>Requirements</h2>
+
+<ul>
+<li>ruby</li>
+
+<li>bundler</li>
+
+<li>rack</li>
+
+<li>0MQ</li>
+
+<li>Redis (on default port)</li>
+
+<li>your front-ends should be synchronized with NTP</li>
+</ul>
+
+<h2 id='statistics'>Statistics</h2>
+
+<p>Statistics that can be computed online are closely related to map-reduce computations. Hence, we do not need to persist HTTP requests for a long time. we can persist intermediary computation instead. By aggregating the intermediary computations, we get a final result. As an example to find the slowest request in a set of requests (i.e., the max of duration), we can partition the set in multiple subsets and proceed in two steps:</p>
+
+<ol>
+<li>compute the max on each subset (we call these results intermediary results)</li>
+
+<li>compute the max of intermediary results</li>
+</ol>
+
+<p>Rack::LiveTraffic statistics partition the requests based on their timestamp in one-second bin. Rack::LiveTraffic then computes statistics and persists intermediary results. When a user calls rack-top, Rack::LiveTraffic then performs the second step. With this approach, Rack::LiveTraffic does not store every HTTP request and keeps the CPU/memory costs bounded.</p>
+
+<h2 id='implementation_details'>Implementation details</h2>
+
+<p>Bullet-list for the impatient:</p>
+
+<ul>
+<li>0MQ for communication between modules</li>
+
+<li>Redis for storage and expiration of old data (i.e., keeps the cache-size small)</li>
+
+<li>uniquify NAT connection</li>
+
+<li>thread-safe (no shared states in the middleware except a Queue, the worker handles that with a mutex)</li>
+</ul>
+
+<h3 id='user_identification'>User identification</h3>
+
+<p>Rack::LiveTraffic can identify distinct users with the same IP (i.e., behind a NAT) provided that:</p>
+
+<ul>
+<li>they have a different user-agent</li>
+
+<li>they are logged on your application and uniquely identified by a cookie (which you have to configure in ./config/livetraffic.yaml at the key middleware::cookie )</li>
+</ul>
+
+<h3 id='time_synchronization'>Time Synchronization</h3>
+
+<p>Rack::LiveTraffic timestamps requests in the middleware. In order to avoid re-implementing a time-synchronization mechanism in Ruby for something already done by NTP with kernel support, we just require that the middleware uses NTP as a time source.</p>
+
+<p>Provided that you use NTP as a time source. Rack::LiveTraffic uses UNIX timestamps with one-second granularity. Hence Rack::LiveTraffic handle the cases where your middleware are in different time zones or cases where there is more than one second delay between the middleware and the workers.</p>
+
+<p>The operation are the following:</p>
+
+<ol>
+<li>middleware gets called on an incoming request</li>
+
+<li>timestamps t0</li>
+
+<li>calls the application higher in the stack</li>
+
+<li>timestamps t1</li>
+
+<li>computes t1 - t0 using the full granularity (i.e., tv_sec + tv_usec)</li>
+
+<li>digest the request into interesting fields</li>
+
+<li>publishes the digest and gives it the timestamp t0.tv_sec , regardless of the duration t1-t0</li>
+</ol>
+
+<h3 id='architecture'>Architecture</h3>
+
+<p>The architecture is the following:</p>
+
+<pre><code>+------------+  +------------+
+| middleware |  | middleware | ...
++------------+  +------------+
+     |(zmq:push)     |  
+     o----------o----o----------- ...
+                | (zmq:pull)
++------------------------------------------------+
+|   re-publisher (rack-dispatch)                 |
++------------------------------------------------+
+                | (zmq:publish)
+                |
+        o-------o------------------------------o----------------------o
+        |                                      |                      |
+        | (zmq:subscribe)                      |                      |
++---------------------------------+            |                      |
+| compute statistics (top-worker) |            |                      |
++---------------------------------+            |                      |
+        | (zmq:publish)                        |                      |
+        |                                      |                      |
+        | (zmq:subscribe)                      |                      |
++----------------+                    +---------------+               |
+|  persist stats |                    | persist HTTP  |               |
++----------------+                    +---------------+               |
+             |                            |                           |
+     +------------------------------------------+                     |
+     |                 Redis                    |                     |
+     +------------------------------------------+                     |
+             |                            |                           |
+       +------------------------------------------------------------------+ 
+       +                   display statistics (rack-top)                  + 
+       +------------------------------------------------------------------+ </code></pre>
+
+<p>So basically:</p>
+
+<ul>
+<li>middlewares compute HTTP request digests and push the digests to a dispatcher</li>
+
+<li>the dispatcher then publishes to whoever is interested</li>
+
+<li>a worker subscribes to reports digests and publishes statistics</li>
+
+<li>a worker persists intermediary statistics (one per second per rack-id)</li>
+
+<li>a worker also persists the HTTP request digests (I explain why it is useful next)</li>
+
+<li>a display then outputs JSON statistics, it can optionally use live requests or use the persisted statistics/requests</li>
+</ul>
+
+<h4 id='why_should_we_persist_http_requests'>Why should we persist HTTP requests?</h4>
+
+<p>For efficiency reasons, the statistics worker computes intermediary statistics periodically and not on each HTTP request. That is, when rack-top runs, the last few seconds of intermediary statistics may not be available yet. To cope with this issue, rack-top computes the missing statistics from the HTTP digests cache. Once intermediary statistics are in Redis, the HTTP digests are of little use. Hence, I recommend to persist HTTP requests for a time slightly larger than the statistics computation rate in the top-worker.</p>
+
+<p>Default parameters compute intermediary statistics every 5 seconds, and persist HTTP digest for 10 seconds.</p>
+
+<h3 id='overall_cost_computations'>Overall cost computations</h3>
+
+<p>Back of the envelope/bottom of the Readme.md calculations:</p>
+
+<h4 id='variables'>variables</h4>
+
+<ul>
+<li>r: number of rack-ids (depend on the app, say ~10)</li>
+
+<li>s: number of statistics (depend on the app, say 5 like in Dimelo contest)</li>
+
+<li>h: history size in seconds (300 for 5minutes)</li>
+
+<li>S: statistics refresh rate (5 secs.)</li>
+
+<li>H: HTTP history size in seconds (say 2<em>S = 10secs)</em></li>
+
+<li>R: request arrival rate (in req/s, say 1000)</li>
+</ul>
+
+<h4 id='memorysize'>memory-size</h4>
+
+<p>M = (r+1)<em>s</em>h + R<em>H = history of statistics times number of rack.id + HTTP requests in the recent history = ~1500 + ~10000 items</em></p>
+
+<p>Here you can play a bit on S (and H) such that you do not persist HTTP request digests for too long. You can also set H to zero by not persisting HTTP request digest at all. In that case, rack-top may report statistics outdated by S seconds (which is small and should not matter too much).</p>
+
+<h4 id='messagerate'>message-rate</h4>
+
+<p>m = 3<em>R + (r+1)</em>s = 1 push per HTTP request + 2subscribed per republished HTTP request + statistics every seconds = ~3000 + ~100 msgs/seq</p>
+
+<p>It seems clear that the limiting factor is the overall number of request per seconds. Hence, the re-publisher will have a lot of load. The good news is that this piece is so simple that you can easily replace it with a C or Haskell application in 50 lines of code.</p>
+
+<h4 id='takeaway'>take-away</h4>
+
+<p>A good leverage is to not persist HTTP request digests (which is optional), we relax the memory size and the message-rate in the application. The drawback of disabling HTTP request persistence is that rack-top may give 5-seconds old statistics (which, IMHO, is not too bad).</p>
+
+<p>Finally, one can also compute intermediary statistics directly in the middleware, but this brings the risk of delaying your application response time. If you browse through the code of Rack::LiveTraffic you will find that you can easily have one worker per rack-id or one worker per statistics. Hence you can split the computation load over different machines with not too much efforts (at the expense of more messages).</p>
+
+<h2 id='usage'>Usage</h2>
+
+<h3 id='simple_usage__demo'>Simple usage &#8211; demo</h3>
+
+<p>You can run the example, provided that</p>
+
+<ul>
+<li>TCP ports 5555 to 5558 are free</li>
+
+<li>Redis runs on default port</li>
+</ul>
+
+<p>In a shell:</p>
+
+<pre><code>foreman start</code></pre>
+
+<p>In another shell:</p>
+
+<pre><code>ab -n 100 HTTP://localhost:9292/</code></pre>
+
+<p>In yet another shell:</p>
+
+<pre><code>bundle exec ruby ./script/rack-top        #for all requests
+bundle exec ruby ./script/rack-top foobar #for requests with rack-livetraffic set to &quot;foobar&quot;</code></pre>
+
+<h3 id='advanced_usage'>Advanced usage</h3>
+
+<p>The rack-top script can take a second argument, which is the configuration file to use. Besides the configuration file, rack-top also has some marvelous command line options:</p>
+
+<ul>
+<li><pre>--no-redis-HTTP</pre>
+<p>Do not reload HTTP requests from the Redis cache, i.e. the last few seconds may not be taken into account, using this option will reduce load on the script if you have a lot of requests per seconds.</p>
+</li>
+
+<li><pre>--no-redis-stats</pre>
+<p>Do not read pre-computed stats from the Redis cache, i.e. will not take into account the full last 3minutes but only the very recent history, you should avoid using this option but it can be useful for debugging purpose.</p>
+</li>
+
+<li><pre>--loop</pre>
+<p>Do not exit the program, rack-top will periodically print up-to-date results on STDOUT.</p>
+</li>
+</ul>
+
+<p>Note that if you use these options you must use these options after explicitly giving the rack-livetraffic-id (which can be an empty string for none), and the path to the configuration file. For example:</p>
+
+<pre><code>bundle exec ruby ./script/rack-top &#39;&#39; ./config/livetraffic.yaml --loop --no-redis-HTTP</code></pre>
+
+<p>In other words, you must pass the rack_id (optionally empty) and the config path explicitly.</p>
+
+<h2 id='author'>Author</h2>
+
+<ul>
+<li>Lucas DiCioccio <a href='HTTP://dicioccio.fr'>page</a> <a href='HTTP://unchoke.me'>blog</a></li>
+</ul>
+</body></html>

@@ -1,0 +1,9 @@
+
+require 'rack-livetraffic/persister'
+require 'yaml'
+path = ARGV.first || './config/livetraffic.yaml'
+hash = YAML.load_file path
+cfg  = hash[:persist][:http]
+
+Rack::LiveTraffic::HttpPersister.new(cfg).run  do |i|
+end
